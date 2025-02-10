@@ -1,66 +1,81 @@
 import chromadb
-from chromadb.config import Settings
+import openai
+from sentence_transformers import SentenceTransformer
 from typing import List, Union, Generator, Iterator
 from schemas import OpenAIChatMessage
 
-
 class Pipeline:
     def __init__(self):
-        self.client = None
+        self.embedding_model = None
+        self.chroma_client = None
         self.collection = None
+        self.openai_client = None
 
     async def on_startup(self):
-        # Set the OpenAI API key
-        import os
-        os.environ["OPENAI_API_KEY"] = "your-api-key-here"
-
-        # Initialize Chroma client
-        self.client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory="./chroma_db"))
+        # Initialize components
+        self.embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
         
-        # Load documents and create an index/collection in ChromaDB
-        documents = self.load_documents("./data")  # Load documents from your data directory
-        self.collection = self.client.create_collection("knowledge_base")
-
-        # Add documents to ChromaDB collection
-        for doc in documents:
-            self.collection.add(
-                documents=[doc["text"]],
-                metadatas=[doc["metadata"]],
-                ids=[doc["id"]],
-            )
+        # ChromaDB configuration
+        self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
+        try:
+            self.collection = self.chroma_client.get_collection("scripts")
+        except ValueError:
+            raise RuntimeError("Collection 'scripts' not found in ChromaDB")
+            
+        # OpenAI client setup
+        self.openai_client = openai.OpenAI(api_key="your-api-key-here")
 
     async def on_shutdown(self):
-        # This function is called when the server is stopped.
-        pass
+        # Cleanup resources
+        if self.openai_client:
+            self.openai_client.close()
 
-    def load_documents(self, directory: str) -> List[dict]:
-        # Placeholder function to load documents from a directory (you can customize it based on your data format)
-        import os
-        documents = []
-        for filename in os.listdir(directory):
-            with open(os.path.join(directory, filename), "r") as file:
-                text = file.read()
-                documents.append({"id": filename, "text": text, "metadata": {"source": filename}})
-        return documents
+    def pipe(
+        self, user_message: str, model_id: str, messages: List[dict], body: dict
+    ) -> Union[str, Generator, Iterator]:
+        try:
+            # Embed the user query
+            query_embedding = self.embedding_model.encode(user_message).tolist()
+            
+            # Retrieve context from ChromaDB
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=3,
+                include=["metadatas"]
+            )
+            
+            # Process results
+            context = self._process_results(results)
+            
+            # Generate response with OpenAI
+            return self._generate_response(user_message, context)
+            
+        except Exception as e:
+            return f"Error processing request: {str(e)}"
 
-    def pipe(self, user_message: str, model_id: str, messages: List[dict], body: dict) -> Union[str, Generator, Iterator]:
-        # This function retrieves relevant documents from the ChromaDB collection based on the user's query
+    def _process_results(self, results: dict) -> str:
+        """Extract and format context from ChromaDB results"""
+        if not results or not results.get("metadatas"):
+            return ""
+            
+        context_parts = []
+        for metadata in results["metadatas"][0]:
+            if metadata and "script" in metadata:
+                context_parts.append(metadata["script"])
+        return "\n\n".join(context_parts)
 
-        print(messages)
-        print(user_message)
-
-        # Query the collection with the user's message (assuming it's converted to embeddings)
-        query_results = self.collection.query(query_embeddings=user_message, n_results=5)
-
-        # Process the results and return a response (customize this based on your needs)
-        response = self.synthesize_response(query_results)
+    def _generate_response(self, query: str, context: str) -> str:
+        """Generate response using OpenAI with proper context handling"""
+        prompt = f"Context:\n{context}\n\nQuery: {query}" if context else query
         
-        return response
-
-    def synthesize_response(self, query_results: dict) -> str:
-        # Synthesize the response based on the query results (this is a placeholder)
-        # You would typically format and combine relevant document excerpts here
-        response = "Relevant information:\n"
-        for result in query_results["documents"]:
-            response += f"- {result}\n"
-        return response
+        response = self.openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{
+                "role": "user",
+                "content": f"Answer based on the context below. If unsure, say so.\n\n{prompt}"
+            }],
+            temperature=0.7,
+            max_tokens=500
+        )
+        
+        return response.choices[0].message.content
