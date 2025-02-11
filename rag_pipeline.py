@@ -1,66 +1,63 @@
-import chromadb
-from sentence_transformers import SentenceTransformer
+"""
+title: Llama Index Pipeline
+author: open-webui
+date: 2024-05-30
+version: 1.0
+license: MIT
+description: A pipeline for retrieving relevant information from a knowledge base using the Llama Index library.
+requirements: llama-index
+"""
+import os
+from typing import List, Union, Generator, Iterator
+from schemas import OpenAIChatMessage
 
-# ✅ Load embedding model
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-# ✅ Connect to ChromaDB
-DB_PATH = "/app/RAG/script_db"  # Adjust the path if needed
-db = chromadb.PersistentClient(path=DB_PATH)
-collection = db.get_collection("scripts")
+class Pipeline:
+    class Valves(BaseModel):
+        OLLAMA_API_BASE_URL: str = "http://localhost:11434"
+        OLLAMA_API_KEY: str = "if you are hosting ollama, put api key here"
+        Pipelines: list[str] = []
+        priority: int = 0
 
+    def __init__(self):
+        self.documents = None
+        self.index = None
 
-# ✅ Function to retrieve similar scripts
-def retrieve_scripts(query, n_results=3):
-    """
-    Searches ChromaDB for relevant scripts based on the user query.
-    Returns the retrieved scripts as a formatted string.
-    """
-    query_embedding = embedding_model.encode(query).tolist()
-
-    # ✅ Query ChromaDB
-    results = collection.query(query_embeddings=[query_embedding], n_results=n_results)
-
-    if not results or "metadatas" not in results or not results.get("metadatas"):
-        print("⚠️ No metadata found in ChromaDB query results.")
-        return ""
-
-    # ✅ Extract script text safely
-    retrieved_texts = []
-    for metadata in results["metadatas"][0]:  # Iterate through metadata list
-        if isinstance(metadata, dict) and "script" in metadata:
-            retrieved_texts.append(metadata["script"])
+        if valves:
+            self.valves = self.Valves(**valves)  # Load values from WebUI if provided
         else:
-            print(f"⚠️ Metadata missing 'script' key: {metadata}")
+            self.valves = self.Valves(
+                OLLAMA_API_BASE_URL=os.getenv("OLLAMA_API_BASE_URL", "http://localhost:11434"),
+                OLLAMA_API_KEY=os.getenv("OLLAMA_API_KEY", ""),
+                Pipelines=[],
+                priority=0,
+            )  
 
-    # ✅ Return retrieved scripts as a formatted string
-    return "\n\n".join(retrieved_texts) if retrieved_texts else ""
+    async def on_startup(self):
+        # Set the OpenAI API key
+        os.environ["OPENAI_API_KEY"] = "your-api-key-here"
 
+        from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
 
-# ✅ Process request before sending to model
-def process_request(request: dict) -> dict:
-    """
-    This function modifies the Open WebUI request by adding retrieved script context
-    before sending it to the language model.
-    """
+        self.documents = SimpleDirectoryReader("./data").load_data()
+        self.index = VectorStoreIndex.from_documents(self.documents)
+        # This function is called when the server is started.
+        pass
 
-    # ✅ Extract user message (last message in the chat)
-    if "messages" not in request or not isinstance(request["messages"], list):
-        print("⚠️ Invalid request format. Missing 'messages' key or not a list.")
-        return request  # Return the request unchanged if it's invalid
+    async def on_shutdown(self):
+        # This function is called when the server is stopped.
+        pass
 
-    query = request["messages"][-1].get("content", "")
+    def pipe(
+        self, user_message: str, model_id: str, messages: List[dict], body: dict
+    ) -> Union[str, Generator, Iterator]:
+        # This is where you can add your custom RAG pipeline.
+        # Typically, you would retrieve relevant information from your knowledge base and synthesize it to generate a response.
 
-    # ✅ Retrieve relevant scripts
-    retrieved_context = retrieve_scripts(query)
+        print(messages)
+        print(user_message)
 
-    # ✅ Inject retrieved scripts into the system prompt
-    if retrieved_context:
-        system_message = {
-            "role": "system",
-            "content": f"Use the following scripts as reference when generating your response:\n\n{retrieved_context}"
-        }
-        request["messages"].insert(0, system_message)  # Add at the beginning
+        query_engine = self.index.as_query_engine(streaming=True)
+        response = query_engine.query(user_message)
 
-    # ✅ Return the modified request (pipeline continues)
-    return request
+        return response.response_gen
